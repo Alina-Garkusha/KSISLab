@@ -1,0 +1,181 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Diagnostics;
+using System.Threading;
+
+namespace CustomTraceroute
+{
+    class Program
+    {
+        // Константы для ICMP
+        const int ICMP_ECHO_REQUEST = 8;
+        const int ICMP_ECHO_REPLY = 0;
+        const int ICMP_TIME_EXCEEDED = 11;
+        const int MAX_HOPS = 30;
+        const int PACKET_SIZE = 64;
+        const int RECEIVE_TIMEOUT = 4000;
+
+        static void Main(string[] args)
+        {
+            if (args.Length < 1)
+            {
+                Console.WriteLine($"Запустите приложение через командную строку от имени администратора.");
+                return;
+            }
+
+            string targetHost = args[0];
+            IPAddress targetIp;
+
+            try
+            {
+                IPHostEntry hostEntry = Dns.GetHostEntry(targetHost);
+                targetIp = hostEntry.AddressList[0];
+                Console.WriteLine($"Трассировка маршрута к {targetHost} [{targetIp}]");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Ошибка разрешения имени: {ex.Message}");
+                return;
+            }
+
+            Console.WriteLine("  #     RTT1      RTT2      RTT3      Адрес узла");
+            Console.WriteLine("-----------------------------------------------");
+
+            // Raw socket для ICMP
+            Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ProtocolType.Icmp);
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, RECEIVE_TIMEOUT);
+
+            // Идентификатор процесса для различия наших пакетов
+            short processId = (short)Process.GetCurrentProcess().Id;
+
+            try
+            {
+                for (int ttl = 1; ttl <= MAX_HOPS; ttl++)
+                {
+                    socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.IpTimeToLive, ttl);
+
+                    int successes = 0;
+                    string nodeAddress = "";
+
+                    // 3 пакета на каждый hop
+                    for (int i = 0; i < 3; i++)
+                    {
+                        string rtt = "*";
+                        byte[] packet = BuildIcmpPacket(processId, (short)i);
+
+                        try
+                        {
+                            Stopwatch sw = Stopwatch.StartNew();
+                            socket.SendTo(packet, new IPEndPoint(targetIp, 0));
+
+                            byte[] receiveBuffer = new byte[256];
+                            EndPoint remoteEndPoint = new IPEndPoint(IPAddress.Any, 0);
+                            int received = socket.ReceiveFrom(receiveBuffer, ref remoteEndPoint);
+                            sw.Stop();
+
+                            // Определяем смещение IP-заголовка (если присутствует)
+                            int ipHeaderLength = 0;
+                            if (received >= 20)
+                            {
+                                int versionAndIhl = receiveBuffer[0];
+                                int version = (versionAndIhl >> 4) & 0x0F;
+                                if (version == 4)
+                                {
+                                    ipHeaderLength = (versionAndIhl & 0x0F) * 4;
+                                }
+                            }
+
+                            if (received >= ipHeaderLength + 8)
+                            {
+                                byte icmpType = receiveBuffer[ipHeaderLength];
+                                nodeAddress = ((IPEndPoint)remoteEndPoint).Address.ToString();
+
+                                if (icmpType == ICMP_TIME_EXCEEDED || icmpType == ICMP_ECHO_REPLY)
+                                {
+                                    rtt = $"{sw.ElapsedMilliseconds} ms";
+                                    successes++;
+                                }
+                            }
+                        }
+                        catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
+                        {
+                            rtt = "*";
+                        }
+                        catch (Exception ex)
+                        {
+                            rtt = $"Err:{ex.Message}";
+                        }
+
+                        Console.Write($"{rtt,-10}");
+                    }
+
+                    Console.WriteLine($" {nodeAddress}");
+
+                    // Завершаем, если достигли цели
+                    if (nodeAddress == targetIp.ToString() && successes > 0)
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\nКритическая ошибка: {ex.Message}");
+                Console.WriteLine("Убедитесь, что запущено от имени Администратора!");
+            }
+            finally
+            {
+                socket.Close();
+            }
+        }
+
+        // Формирование ICMP пакета
+        static byte[] BuildIcmpPacket(short id, short sequence)
+        {
+            byte[] packet = new byte[PACKET_SIZE];
+
+            packet[0] = ICMP_ECHO_REQUEST;  // Type
+            packet[1] = 0;                   // Code
+            packet[2] = 0; packet[3] = 0;    // Checksum
+            packet[4] = (byte)(id >> 8);     // Identifier
+            packet[5] = (byte)(id & 0xFF);
+            packet[6] = (byte)(sequence >> 8); // Sequence Number
+            packet[7] = (byte)(sequence & 0xFF);
+
+            for (int i = 8; i < PACKET_SIZE; i++)
+                packet[i] = (byte)'A';
+
+            // Расчет и установка контрольной суммы
+            ushort checksum = CalculateChecksum(packet);
+            packet[2] = (byte)(checksum >> 8);
+            packet[3] = (byte)(checksum & 0xFF);
+
+            return packet;
+        }
+
+        // Расчет контрольной суммы по алгоритму RFC 1071
+        static ushort CalculateChecksum(byte[] packet)
+        {
+            long sum = 0;
+            int length = packet.Length;
+            int index = 0;
+
+            while (length > 1)
+            {
+                sum += (ushort)((packet[index] << 8) + packet[index + 1]);
+                index += 2;
+                length -= 2;
+            }
+
+            if (length == 1)
+                sum += packet[index];
+
+            while ((sum >> 16) > 0)
+                sum = (sum & 0xFFFF) + (sum >> 16);
+
+            return (ushort)~sum;
+        }
+    }
+}
