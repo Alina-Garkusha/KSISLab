@@ -1,0 +1,180 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace ConsoleChatSocket
+{
+    internal class Program
+    {
+        private static TcpListener? _serverListener;
+        private static TcpClient? _myClient;
+        private static readonly List<TcpClient> _clients = new();
+        private static readonly object _lock = new();
+        private static bool _isRunning = false;
+        private static string _userName = "User";
+
+        static async Task Main(string[] args)
+        {
+            Console.OutputEncoding = Encoding.UTF8;
+            Console.InputEncoding = Encoding.UTF8;
+            Console.CancelKeyPress += (_, e) => { e.Cancel = true; ExitGracefully(); };
+
+            Console.Write("Ваше имя в чате: ");
+            _userName = Console.ReadLine()?.Trim() ?? "User";
+
+            Console.Write("Режим (1 - Сервер, 2 - Клиент): ");
+            string mode = Console.ReadLine()?.Trim();
+
+            Console.Write("IP-адрес: ");
+            string ip = Console.ReadLine()?.Trim() ?? "127.0.0.1";
+
+            Console.Write("Порт: ");
+            int port = int.TryParse(Console.ReadLine(), out var p) ? p : 5000;
+
+            if (!IsPortAvailable(port) && mode == "1")
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Порт {port} уже занят другим процессом.");
+                Console.ResetColor();
+                return;
+            }
+
+            _isRunning = true;
+            Console.WriteLine("Соединение устанавливается...");
+
+            if (mode == "1") await StartServerAsync(port);
+            else await StartClientAsync(ip, port);
+        }
+
+        private static bool IsPortAvailable(int port)
+        {
+            var ipProps = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties();
+            return !ipProps.GetActiveTcpListeners().Any(ep => ep.Port == port);
+        }
+
+    
+        private static async Task StartServerAsync(int port)
+        {
+            _serverListener = new TcpListener(IPAddress.Any, port);
+            _serverListener.Start();
+            Console.WriteLine($"Сервер запущен на 0.0.0.0:{port}. Ожидание клиентов...");
+
+            while (_isRunning)
+            {
+                try
+                {
+                    var client = await _serverListener.AcceptTcpClientAsync();
+                    lock (_lock) _clients.Add(client);
+                    Console.WriteLine($"Подключился: {client.Client.RemoteEndPoint}");
+                    _ = HandleClientAsync(client);
+                }
+                catch { break; }
+            }
+        }
+
+        private static async Task HandleClientAsync(TcpClient client)
+        {
+            using var reader = new System.IO.StreamReader(client.GetStream(), Encoding.UTF8);
+            try
+            {
+                while (_isRunning)
+                {
+                    var msg = await reader.ReadLineAsync();
+                    if (string.IsNullOrEmpty(msg)) break;
+
+                    Console.WriteLine(msg);
+                    BroadcastMessage(msg, client);
+                }
+            }
+            catch { }
+            finally
+            {
+                lock (_lock) _clients.Remove(client);
+                Console.WriteLine($"Отключился: {client.Client.RemoteEndPoint}");
+                if (!_isRunning) ExitGracefully();
+            }
+        }
+
+        private static void BroadcastMessage(string msg, TcpClient sender)
+        {
+            lock (_lock)
+            {
+                foreach (var c in _clients.Where(c => c != sender && c.Connected))
+                {
+                    try
+                    {
+                        var sw = new System.IO.StreamWriter(c.GetStream(), Encoding.UTF8) { AutoFlush = true };
+                        sw.WriteLine(msg);
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        private static async Task StartClientAsync(string ip, int port)
+        {
+            try
+            {
+                _myClient = new TcpClient();
+                await _myClient.ConnectAsync(IPAddress.Parse(ip), port);
+                Console.WriteLine("Успешно подключено к серверу.");
+
+                _ = Task.Run(async () =>
+                {
+                    using var reader = new System.IO.StreamReader(_myClient.GetStream(), Encoding.UTF8);
+                    while (_isRunning)
+                    {
+                        var msg = await reader.ReadLineAsync();
+                        if (msg == null) break;
+                        Console.WriteLine(msg);
+                    }
+                });
+
+                Console.WriteLine("Введите сообщение (или 'exit' для выхода):");
+                var stream = _myClient.GetStream();
+                while (_isRunning)
+                {
+                    string input = Console.ReadLine() ?? "";
+                    if (input.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
+                    if (string.IsNullOrWhiteSpace(input)) continue;
+
+                    var writer = new System.IO.StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+                    await writer.WriteLineAsync($"[{_userName}]: {input}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Ошибка подключения: {ex.Message}");
+                Console.ResetColor();
+            }
+            finally { ExitGracefully(); }
+        }
+
+        private static void ExitGracefully()
+        {
+            if (!_isRunning) return;
+            _isRunning = false;
+            Console.WriteLine("\nЗавершение работы...");
+
+            try
+            {
+                _myClient?.Close();
+                _serverListener?.Stop();
+                lock (_lock)
+                {
+                    foreach (var c in _clients) c.Close();
+                    _clients.Clear();
+                }
+            }
+            catch { }
+
+            Console.WriteLine("Программа завершена.");
+            Environment.Exit(0);
+        }
+    }
+}
