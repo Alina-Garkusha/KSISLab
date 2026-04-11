@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
+using System.Runtime.InteropServices;
 
 namespace ConsoleChatSocket
 {
@@ -17,37 +18,122 @@ namespace ConsoleChatSocket
         private static bool _isRunning = false;
         private static string _userName = "User";
 
+        [DllImport("kernel32.dll")]
+        private static extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate HandlerRoutine, bool Add);
+        private delegate bool ConsoleCtrlDelegate(int CtrlType);
+
+        private static bool ConsoleCtrlHandler(int ctrlType)
+        {
+            if (ctrlType == 2)
+            {
+                ExitGracefully();
+                return true;
+            }
+            return false;
+        }
+
         static async Task Main(string[] args)
         {
             Console.OutputEncoding = Encoding.UTF8;
             Console.InputEncoding = Encoding.UTF8;
-            Console.CancelKeyPress += (_, e) => { e.Cancel = true; ExitGracefully(); };
 
-            Console.Write("Ваше имя в чате: ");
-            _userName = Console.ReadLine()?.Trim() ?? "User";
+            SetConsoleCtrlHandler(ConsoleCtrlHandler, true);
 
-            Console.Write("Режим (1 - Сервер, 2 - Клиент): ");
-            string mode = Console.ReadLine()?.Trim();
+            while (true)
+            {
+                Console.Write("Ваше имя в чате: ");
+                string nameInput = Console.ReadLine()?.Trim();
+                if (!string.IsNullOrWhiteSpace(nameInput)) { _userName = nameInput; break; }
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Имя не может быть пустым. Попробуйте ещё раз.");
+                Console.ResetColor();
+            }
 
-            Console.Write("IP-адрес: ");
-            string ip = Console.ReadLine()?.Trim() ?? "127.0.0.1";
+            string mode = "";
+            while (true)
+            {
+                Console.Write("Режим (1 - Сервер, 2 - Клиент): ");
+                mode = Console.ReadLine()?.Trim();
+                if (mode == "1" || mode == "2") break;
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Неверный режим. Введите 1 или 2.");
+                Console.ResetColor();
+            }
 
-            Console.Write("Порт: ");
-            int port = int.TryParse(Console.ReadLine(), out var p) ? p : 5000;
+            string serverIp = "";
+            while (true)
+            {
+                Console.Write("IP-адрес сервера: ");
+                string ipInput = Console.ReadLine()?.Trim();
+                if (string.IsNullOrWhiteSpace(ipInput))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Ошибка: IP-адрес не может быть пустым.");
+                    Console.ResetColor(); continue;
+                }
+                if (IPAddress.TryParse(ipInput, out var parsedIp) &&
+                    parsedIp.AddressFamily == AddressFamily.InterNetwork &&
+                    ipInput.Split('.').Length == 4)
+                { serverIp = ipInput; break; }
 
-            if (!IsPortAvailable(port) && mode == "1")
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Ошибка: '{ipInput}' — некорректный формат IP-адреса (пример: 127.0.0.1).");
+                Console.ResetColor();
+            }
+
+            int port = 0;
+            while (true)
+            {
+                Console.Write("Порт сервера: ");
+                string portInput = Console.ReadLine()?.Trim();
+                if (string.IsNullOrWhiteSpace(portInput))
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine("Ошибка: Порт не может быть пустым.");
+                    Console.ResetColor(); continue;
+                }
+                if (int.TryParse(portInput, out port) && port >= 1 && port <= 65535) break;
+
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"Ошибка: '{portInput}' — некорректный номер порта.");
+                Console.ResetColor();
+            }
+
+            if (mode == "1" && !IsPortAvailable(port))
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Порт {port} уже занят другим процессом.");
+                Console.WriteLine($"Ошибка: Порт {port} уже занят!");
                 Console.ResetColor();
-                return;
+                Console.WriteLine("Нажмите любую клавишу для выхода...");
+                Console.ReadKey(); return;
+            }
+
+            string localIp = serverIp;
+            if (mode == "2")
+            {
+                while (true)
+                {
+                    Console.Write("IP-адрес клиента: ");
+                    string localIpInput = Console.ReadLine()?.Trim();
+                    if (string.IsNullOrWhiteSpace(localIpInput))
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine("Ошибка: Локальный IP не может быть пустым.");
+                        Console.ResetColor(); continue;
+                    }
+                    if (IPAddress.TryParse(localIpInput, out _)) { localIp = localIpInput; break; }
+
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"Ошибка: '{localIpInput}' — некорректный формат IP-адреса.");
+                    Console.ResetColor();
+                }
             }
 
             _isRunning = true;
-            Console.WriteLine("Соединение устанавливается...");
+            Console.WriteLine("\nСоединение устанавливается...");
 
             if (mode == "1") await StartServerAsync(port);
-            else await StartClientAsync(ip, port);
+            else await StartClientAsync(serverIp, port, localIp);
         }
 
         private static bool IsPortAvailable(int port)
@@ -56,12 +142,11 @@ namespace ConsoleChatSocket
             return !ipProps.GetActiveTcpListeners().Any(ep => ep.Port == port);
         }
 
-    
         private static async Task StartServerAsync(int port)
         {
             _serverListener = new TcpListener(IPAddress.Any, port);
             _serverListener.Start();
-            Console.WriteLine($"Сервер запущен на 0.0.0.0:{port}. Ожидание клиентов...");
+            Console.WriteLine($"Сервер запущен. Ожидание подключений на порт {port}...");
 
             while (_isRunning)
             {
@@ -69,7 +154,7 @@ namespace ConsoleChatSocket
                 {
                     var client = await _serverListener.AcceptTcpClientAsync();
                     lock (_lock) _clients.Add(client);
-                    Console.WriteLine($"Подключился: {client.Client.RemoteEndPoint}");
+                    Console.WriteLine($"Подключился клиент: {client.Client.RemoteEndPoint}");
                     _ = HandleClientAsync(client);
                 }
                 catch { break; }
@@ -94,8 +179,7 @@ namespace ConsoleChatSocket
             finally
             {
                 lock (_lock) _clients.Remove(client);
-                Console.WriteLine($"Отключился: {client.Client.RemoteEndPoint}");
-                if (!_isRunning) ExitGracefully();
+                Console.WriteLine($"Клиент отключился: {client.Client.RemoteEndPoint}");
             }
         }
 
@@ -115,13 +199,17 @@ namespace ConsoleChatSocket
             }
         }
 
-        private static async Task StartClientAsync(string ip, int port)
+        private static async Task StartClientAsync(string serverIp, int port, string localIp)
         {
             try
             {
                 _myClient = new TcpClient();
-                await _myClient.ConnectAsync(IPAddress.Parse(ip), port);
-                Console.WriteLine("Успешно подключено к серверу.");
+
+                _myClient.Client.Bind(new IPEndPoint(IPAddress.Parse(localIp), 0));
+
+                await _myClient.ConnectAsync(IPAddress.Parse(serverIp), port);
+
+                Console.WriteLine($"Успешное подключение.");
 
                 _ = Task.Run(async () =>
                 {
@@ -134,12 +222,10 @@ namespace ConsoleChatSocket
                     }
                 });
 
-                Console.WriteLine("Введите сообщение (или 'exit' для выхода):");
                 var stream = _myClient.GetStream();
                 while (_isRunning)
                 {
                     string input = Console.ReadLine() ?? "";
-                    if (input.Equals("exit", StringComparison.OrdinalIgnoreCase)) break;
                     if (string.IsNullOrWhiteSpace(input)) continue;
 
                     var writer = new System.IO.StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
@@ -149,7 +235,7 @@ namespace ConsoleChatSocket
             catch (Exception ex)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Ошибка подключения: {ex.Message}");
+                Console.WriteLine($"Ошибка: {ex.Message}");
                 Console.ResetColor();
             }
             finally { ExitGracefully(); }
@@ -159,11 +245,11 @@ namespace ConsoleChatSocket
         {
             if (!_isRunning) return;
             _isRunning = false;
-            Console.WriteLine("\nЗавершение работы...");
+            Console.WriteLine("\n Завершение работы...");
 
             try
             {
-                _myClient?.Close();
+                _myClient?.Close(); 
                 _serverListener?.Stop();
                 lock (_lock)
                 {
