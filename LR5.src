@@ -1,0 +1,227 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Text.Json;
+using System.Linq;
+
+class Program
+{
+    static string storageRoot = Path.Combine(Directory.GetCurrentDirectory(), "storage");
+
+    static void Main(string[] args)
+    {
+        if (!Directory.Exists(storageRoot))
+            Directory.CreateDirectory(storageRoot);
+
+        HttpListener listener = new HttpListener();
+        listener.Prefixes.Add("http://localhost:8080/");
+        listener.Start();
+
+        Console.WriteLine("Сервер запущен: http://localhost:8080/");
+
+        try
+        {
+            while (true)
+            {
+                var context = listener.GetContext();
+                HandleRequest(context);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка: {ex.Message}");
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    static void HandleRequest(HttpListenerContext context)
+    {
+        var request = context.Request;
+        var response = context.Response;
+
+        string method = request.HttpMethod;
+        string path = request.Url.AbsolutePath.TrimStart('/');
+        string filePath = Path.Combine(storageRoot, path);
+
+        Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] [{method}] {path}");
+
+        try
+        {
+            string fullPath = Path.GetFullPath(filePath);
+            string rootFullPath = Path.GetFullPath(storageRoot);
+
+            if (!fullPath.StartsWith(rootFullPath, StringComparison.OrdinalIgnoreCase))
+            {
+                SendError(response, 403, "Access denied");
+                return;
+            }
+
+            switch (method)
+            {
+                case "GET":
+                    if (File.Exists(filePath))
+                        SendFile(response, filePath);
+                    else if (Directory.Exists(filePath))
+                        SendDirectoryList(response, filePath);
+                    else
+                        SendError(response, 404, "Not found");
+                    break;
+
+                case "PUT":
+                    HandlePut(response, filePath, request);
+                    break;
+
+                case "HEAD":
+                    if (File.Exists(filePath))
+                        SendFileHeaders(response, filePath);
+                    else if (Directory.Exists(filePath))
+                        SendDirectoryHeaders(response, filePath);
+                    else
+                        SendError(response, 404, "Not found");
+                    break;
+
+                case "DELETE":
+                    HandleDelete(response, filePath);
+                    break;
+
+                default:
+                    SendError(response, 405, "Method not allowed");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка: {ex.Message}");
+            try { SendError(response, 500, "Internal error"); } catch { }
+        }
+    }
+
+    static void HandlePut(HttpListenerResponse response, string filePath, HttpListenerRequest request)
+    {
+        string dir = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            Directory.CreateDirectory(dir);
+
+        using (var fs = File.Create(filePath))
+            request.InputStream.CopyTo(fs);
+
+        response.StatusCode = 201;
+        response.Close();
+        Console.WriteLine($"Файл сохранён");
+    }
+
+    static void HandleDelete(HttpListenerResponse response, string filePath)
+    {
+        if (File.Exists(filePath))
+        {
+            File.Delete(filePath);
+            response.StatusCode = 204;
+            response.Close();
+            Console.WriteLine("Файл удалён");
+        }
+        else if (Directory.Exists(filePath))
+        {
+            Directory.Delete(filePath, true);
+            response.StatusCode = 204;
+            response.Close();
+            Console.WriteLine("Каталог удалён");
+        }
+        else
+        {
+            SendError(response, 404, "Not found");
+        }
+    }
+
+    static void SendFile(HttpListenerResponse response, string filePath)
+    {
+        var info = new FileInfo(filePath);
+        response.ContentType = GetContentType(filePath);
+        response.ContentLength64 = info.Length;
+        response.Headers["Last-Modified"] = info.LastWriteTimeUtc.ToString("R");
+
+        using (var fs = File.OpenRead(filePath))
+            fs.CopyTo(response.OutputStream);
+
+        response.StatusCode = 200;
+        response.Close();
+        Console.WriteLine($"Файл отправлен ({info.Length} байт)");
+    }
+
+    static void SendDirectoryList(HttpListenerResponse response, string dirPath)
+    {
+        var files = Directory.GetFiles(dirPath).Select(Path.GetFileName).OrderBy(f => f).ToArray();
+        var dirs = Directory.GetDirectories(dirPath).Select(Path.GetFileName).OrderBy(d => d).ToArray();
+
+        var result = new { path = dirPath.Replace(storageRoot, "").TrimStart('\\').Replace("\\", "/"), files, directories = dirs };
+        string json = JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true });
+        byte[] buffer = Encoding.UTF8.GetBytes(json);
+
+        response.ContentType = "application/json; charset=utf-8";
+        response.ContentLength64 = buffer.Length;
+        response.OutputStream.Write(buffer, 0, buffer.Length);
+        response.StatusCode = 200;
+        response.Close();
+        Console.WriteLine($"Список: {files.Length} файлов, {dirs.Length} папок");
+    }
+
+    static void SendFileHeaders(HttpListenerResponse response, string filePath)
+    {
+        var info = new FileInfo(filePath);
+        response.ContentLength64 = info.Length;  
+        response.Headers["Last-Modified"] = info.LastWriteTimeUtc.ToString("R");
+        response.ContentType = GetContentType(filePath);
+        response.StatusCode = 200;
+        response.Close();
+        Console.WriteLine($"Заголовки отправлены");
+    }
+
+    static void SendDirectoryHeaders(HttpListenerResponse response, string dirPath)
+    {
+        var info = new DirectoryInfo(dirPath);
+        int count = Directory.GetFiles(dirPath).Length + Directory.GetDirectories(dirPath).Length;
+
+        response.ContentLength64 = 0;
+        response.Headers["Content-Type"] = "application/json";
+        response.Headers["X-Total-Items"] = count.ToString();
+        response.Headers["Last-Modified"] = info.LastWriteTimeUtc.ToString("R");
+        response.StatusCode = 200;
+        response.Close();
+        Console.WriteLine($"Заголовки каталога отправлены");
+    }
+
+    static void SendError(HttpListenerResponse response, int code, string msg)
+    {
+        try
+        {
+            response.StatusCode = code;
+            byte[] buffer = Encoding.UTF8.GetBytes(msg);
+            response.ContentLength64 = buffer.Length;
+            response.OutputStream.Write(buffer, 0, buffer.Length);
+            response.Close();
+            Console.WriteLine($"{code}: {msg}");
+        }
+        catch { }
+    }
+
+    static string GetContentType(string path)
+    {
+        string ext = Path.GetExtension(path)?.ToLowerInvariant();
+        return ext switch
+        {
+            ".txt" => "text/plain",
+            ".html" or ".htm" => "text/html",
+            ".css" => "text/css",
+            ".js" => "application/javascript",
+            ".json" => "application/json",
+            ".png" => "image/png",
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".gif" => "image/gif",
+            ".pdf" => "application/pdf",
+            _ => "application/octet-stream"
+        };
+    }
+}
